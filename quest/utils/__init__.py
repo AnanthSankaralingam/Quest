@@ -20,6 +20,7 @@ __all__ = [
     "decode_sparse_attn",
     "rms_norm_forward",
     "apply_rope_in_place",
+    "get_offloaded_token_info",
 ]
 
 def apply_rope_in_place(
@@ -176,6 +177,7 @@ def decode_estimate(
     """
     Semantics of `decode_estimate`:
     When decoding, estimate the attention score for each page.
+    Enhanced to consider ALL offloaded tokens (prompt + previously decoded).
 
     Notations for shapes:
     `B`: batch size
@@ -190,8 +192,19 @@ def decode_estimate(
         layer_idx: Layer index of the KV cache.
     """
     f = _kernels.estimate_attn_score
-    # (iController.metadata_cache.seqlen - 1) is manually excluding the last elements, which is the current page.
-    o = torch.empty((iController.num_heads, iController.metadata_cache.seqlen - 1), dtype=q.dtype, device=q.device)
+    
+    # Enhanced: Consider all offloaded pages (prompt + decoded tokens)
+    # Get the number of available pages for estimation (excluding current page)
+    total_metadata_pages = iController.metadata_cache.seqlen
+    available_pages_for_estimation = max(0, total_metadata_pages - 1)
+    
+    if available_pages_for_estimation == 0:
+        # No pages available for estimation (only current page exists)
+        return torch.empty((iController.num_heads, 0), dtype=q.dtype, device=q.device)
+    
+    # Create output tensor for all available offloaded pages
+    o = torch.empty((iController.num_heads, available_pages_for_estimation), dtype=q.dtype, device=q.device)
+    
     f(
         q,
         o,
@@ -211,6 +224,7 @@ def decode_topk(
     """
     Semantics of `decode_topk`:
     select top-k pages with highest attention score.
+    Enhanced to work with all offloaded tokens (prompt + decoded).
 
     Notations for shapes:
     `B`: batch size
@@ -220,12 +234,21 @@ def decode_topk(
     `MAXLEN`: maximum length of the KV cache
 
     Args:
-        q: Shape: `[B, N, D]`. Key projection (`X @ W_k`).
+        estimated_attn_score: Shape: `[N, available_pages]`. Attention scores for available pages.
         iController: InferenceController object, which contains all needed information.
-        layer_idx: Layer index of the KV cache.
     """
-    # excluding the last page
-    page_budet = iController.inference_page_budget - 1
+    # Enhanced: Handle dynamic number of available pages
+    if estimated_attn_score.size(1) == 0:
+        # No pages to select from
+        return
+    
+    # Calculate actual page budget based on available pages
+    available_pages = estimated_attn_score.size(1)
+    actual_page_budget = min(iController.inference_page_budget - 1, available_pages)
+    
+    if actual_page_budget <= 0:
+        return
+    
     f = _kernels.topk_filtering
     f(
         estimated_attn_score,
@@ -233,7 +256,7 @@ def decode_topk(
         iController.topk_dout_buffer,
         iController.topk_dindices_buffer,
         iController.topk_buf,
-        page_budet,
+        actual_page_budget,
     )
 
 def decode_sparse_attn(
@@ -274,3 +297,64 @@ def decode_sparse_attn(
         rope_theta,
     )
     return o
+
+def get_offloaded_token_info(iController: InferenceController) -> dict:
+    """
+    Enhanced utility function to get detailed information about offloaded tokens.
+    
+    This function provides comprehensive information about the current state of 
+    offloaded tokens, including prompt tokens and previously decoded tokens,
+    which is useful for debugging and monitoring the Quest KV cache compression.
+    
+    Args:
+        iController: InferenceController object containing cache state
+        
+    Returns:
+        dict: Comprehensive information about offloaded token state
+    """
+    composition = iController.get_token_composition()
+    
+    # Calculate page utilization
+    total_pages = len(iController.kv_cache.indicies)
+    metadata_pages = len(iController.metadata_cache.indicies)
+    page_size = iController.page_size
+    
+    # Estimate tokens per page (accounting for partial last page)
+    if total_pages > 0:
+        last_page_utilization = iController.kv_cache.last_page_len / page_size
+        full_pages = max(0, total_pages - 1)
+        estimated_tokens_in_cache = full_pages * page_size + iController.kv_cache.last_page_len
+    else:
+        last_page_utilization = 0.0
+        estimated_tokens_in_cache = 0
+    
+    # Calculate availability for attention estimation
+    available_for_estimation = max(0, metadata_pages - 1)
+    
+    return {
+        # Token composition
+        'token_composition': composition,
+        
+        # Page information
+        'cache_pages': {
+            'total_kv_pages': total_pages,
+            'total_metadata_pages': metadata_pages,
+            'page_size': page_size,
+            'last_page_utilization': last_page_utilization,
+            'estimated_tokens_in_cache': estimated_tokens_in_cache,
+        },
+        
+        # Attention estimation availability
+        'attention_estimation': {
+            'pages_available_for_estimation': available_for_estimation,
+            'can_perform_estimation': available_for_estimation > 0,
+            'current_page_budget': getattr(iController, 'inference_page_budget', None),
+        },
+        
+        # Offloading status
+        'offloading_status': {
+            'prompt_fully_offloaded': composition['is_in_prefill'] == False,
+            'decoded_tokens_count': composition['decoded_tokens_count'],
+            'all_tokens_available_for_attention': available_for_estimation > 0,
+        }
+    }

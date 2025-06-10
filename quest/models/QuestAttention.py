@@ -121,17 +121,29 @@ class QuestAttention(nn.Module):
             )
             torch.cuda.nvtx.range_pop()
         else:
-            # Skipping layers is controled by PAGE_BUDGET, which is set in LlamaModel.
+            # Enhanced Quest: Consider all offloaded tokens (prompt + decoded) during attention
+            # Skipping layers is controlled by PAGE_BUDGET, which is set in LlamaModel.
             if iController.need_estimate() == False:
+                # Direct attention without estimation - use all available pages
                 torch.cuda.nvtx.range_push("full_attn")
-                attn_output = quest.utils.decode_sparse_attn(
-                    query_states,
-                    iController,
-                    self.layer_idx,
-                    iController.kv_indices_without_last,
-                )
+                
+                # Use available indices for attention (all offloaded tokens)
+                available_indices = iController.kv_indices_without_last if iController.kv_indices_without_last.size(1) > 0 else None
+                
+                if available_indices is not None:
+                    attn_output = quest.utils.decode_sparse_attn(
+                        query_states,
+                        iController,
+                        self.layer_idx,
+                        available_indices,
+                    )
+                else:
+                    # No historical context available, return zeros
+                    attn_output = torch.zeros_like(query_states, dtype=query_states.dtype, device=query_states.device)
+                    
                 torch.cuda.nvtx.range_pop()
             else:
+                # Enhanced Quest: Estimate attention scores for ALL offloaded tokens
                 torch.cuda.nvtx.range_push("estimate")
                 estimated_attn_score = quest.utils.decode_estimate(
                     query_states,
@@ -140,21 +152,26 @@ class QuestAttention(nn.Module):
                 )
                 torch.cuda.nvtx.range_pop()
 
-                torch.cuda.nvtx.range_push("topk")
-                quest.utils.decode_topk(
-                    estimated_attn_score,
-                    iController,
-                )
-                torch.cuda.nvtx.range_pop()
+                # Only proceed with topk if we have scores to work with
+                if estimated_attn_score.size(1) > 0:
+                    torch.cuda.nvtx.range_push("topk")
+                    quest.utils.decode_topk(
+                        estimated_attn_score,
+                        iController,
+                    )
+                    torch.cuda.nvtx.range_pop()
 
-                torch.cuda.nvtx.range_push("approx_attn")
-                attn_output = quest.utils.decode_sparse_attn(
-                    query_states,
-                    iController,
-                    self.layer_idx,
-                    iController.topk_dindices_buffer,
-                )
-                torch.cuda.nvtx.range_pop()
+                    torch.cuda.nvtx.range_push("approx_attn")
+                    attn_output = quest.utils.decode_sparse_attn(
+                        query_states,
+                        iController,
+                        self.layer_idx,
+                        iController.topk_dindices_buffer,
+                    )
+                    torch.cuda.nvtx.range_pop()
+                else:
+                    # No historical context available for estimation
+                    attn_output = torch.zeros_like(query_states, dtype=query_states.dtype, device=query_states.device)
 
         attn_output = attn_output.unsqueeze(0) # unsqueeze the batch dimension
         # FlashInfer output is naturally NHD

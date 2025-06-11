@@ -65,11 +65,4 @@ Key Behavioral Changes:
 - **Attention Estimation**: Enhanced to work with dynamic page counts
 - **Page Selection**: Top-K selection now includes all offloaded content
 - **Memory Management**: Improved buffer allocation for variable page counts
-
-Monitoring and Debugging:
-The system provides comprehensive monitoring through get_offloaded_token_info():
-- Token composition (prompt vs decoded)
-- Page utilization and availability  
-- Attention estimation capabilities
-- Offloading status and effectiveness
 """
